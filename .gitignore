@@ -1,0 +1,25 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# OCR runtime state and generated results
+.cma_ocr_resume/
+.cma_ocr_running.lock
+.cma_web_job.json
+runs/
+cma_results*.csv
+cma_results*.xlsx
+cma_results*.log
+
+# Local documents are intentionally not versioned
+*.pdf
+
+
