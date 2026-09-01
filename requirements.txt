@@ -1,0 +1,15 @@
+# Exact versions for the isolated cma_ocr27_web environment.
+numpy==1.23.5
+paddlepaddle==2.6.2
+paddleocr==2.7.0.3
+opencv-python==4.6.0.66
+opencv-contrib-python==4.6.0.66
+opencv-python-headless==4.6.0.66
+PyMuPDF==1.20.2
+Pillow==10.4.0
+pytesseract==0.3.13
+openpyxl==3.1.5
+setuptools==69.5.1
+streamlit==1.39.0
+streamlit-autorefresh==1.0.1
+
