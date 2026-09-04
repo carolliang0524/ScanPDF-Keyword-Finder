@@ -16,8 +16,8 @@ if not defined BASE_PY (
     )
 )
 
-set "OCR_SCRIPT=%~dp0cma_dual_keyword_enhanced.py"
-set "WEB_APP=%~dp0cma_web_app.py"
+set "OCR_SCRIPT=%~dp0cma_dual_keyword_parallel.py"
+set "WEB_APP=%~dp0cma_web_app_parallel.py"
 if not defined BASE_PY (
     echo [ERROR] Python was not found. Install Anaconda Python first.
     goto :failed
@@ -30,7 +30,7 @@ if not exist "%WEB_APP%" (
     echo [ERROR] Web app was not found: %WEB_APP%
     goto :failed
 )
-echo [1/2] Checking the independent web OCR environment...
+echo [1/2] Checking the shared parallel web OCR environment and both engines...
 "%BASE_PY%" "%OCR_SCRIPT%" --check-env-only
 if errorlevel 1 goto :failed
 
@@ -42,7 +42,7 @@ if not exist "%WEB_PY%" (
 )
 
 echo.
-echo [2/2] Starting the local web page. Keep this window open.
+echo [2/2] Starting the local parallel web page. Keep this window open.
 echo Browser address: http://127.0.0.1:8501
 echo Closing the browser tab does not stop OCR. Closing this window does.
 "%WEB_PY%" -m streamlit run "%WEB_APP%" --server.address 127.0.0.1 --server.port 8501 --browser.gatherUsageStats false
@@ -60,4 +60,3 @@ echo Keep this window open and copy its complete output for diagnosis.
 popd
 pause
 exit /b 1
-

@@ -39,7 +39,8 @@ except ImportError:
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent
-OCR_SCRIPT = PACKAGE_DIR / "cma_dual_keyword_enhanced.py"
+APP_VERSION = "1.1.0"
+OCR_SCRIPT = PACKAGE_DIR / "cma_dual_keyword_parallel.py"
 JOB_FILE_NAME = ".cma_web_job.json"
 RAW_HEADER = [
     "文件名", "页码", "关键词", "实际匹配文本", "匹配方式", "匹配得分",
@@ -232,6 +233,22 @@ def read_resume_state(output_root: Path) -> dict[str, Any]:
         return {}
 
 
+def read_parallel_progress(output_root: Path, is_running: bool) -> dict[str, Any]:
+    """Read the compact parent-owned dual-engine status snapshot."""
+    path = output_root / ".cma_ocr_resume" / "parallel_progress.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("mode") != "parallel_render_once":
+            return {}
+        if is_running:
+            return data
+        # Keep a crashed/incomplete snapshot visible for diagnosis. A completed
+        # job normally clears the resume directory after publishing final CSVs.
+        return data if data.get("overall_state") != "completed" else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
 def state_matches_job(state: dict[str, Any], job: dict[str, Any]) -> bool:
     """Reject raw files left by an older task during the new process startup gap."""
     if not state or not job:
@@ -328,6 +345,54 @@ def provisional_rows(rows: list[dict[str, str]], engine: str) -> list[dict[str, 
     )
 
 
+def parallel_provisional_rows(
+    tesseract_rows: list[dict[str, str]],
+    paddle_rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Build a live neutral union while the final context-aware merge is pending."""
+    combined = (
+        provisional_rows(tesseract_rows, "tesseract")
+        + provisional_rows(paddle_rows, "paddle")
+    )
+    best: dict[tuple[str, str, str], dict[str, str]] = {}
+    engines: dict[tuple[str, str, str], set[str]] = {}
+    method_rank = {"exact_normalized": 3, "exact": 3, "ocr_confusion": 2, "fuzzy": 1}
+    for source in combined:
+        key = (
+            source.get("文件名", ""), source.get("页码", ""), source.get("关键词", "")
+        )
+        engine = (source.get("识别引擎", "") or source.get("来源引擎", "")).strip()
+        if engine:
+            engines.setdefault(key, set()).add(engine)
+        old = best.get(key)
+        rank = (method_rank.get(source.get("匹配方式", ""), 0), _score_number(source))
+        old_rank = (
+            method_rank.get(old.get("匹配方式", ""), 0), _score_number(old)
+        ) if old else (-1, -1.0)
+        if old is None or rank > old_rank:
+            best[key] = dict(source)
+
+    result: list[dict[str, str]] = []
+    for key, row in best.items():
+        source_engines = sorted(engines.get(key, set()))
+        engine_text = "+".join(source_engines)
+        row["来源引擎"] = engine_text
+        row["识别引擎"] = engine_text
+        row["引擎结论"] = (
+            "双引擎实时共同命中" if len(source_engines) >= 2 else "单引擎实时命中"
+        )
+        row["结果状态"] = "实时汇总（任务结束后切换最终 merge）"
+        row["置信度"] = "阶段性"
+        result.append(row)
+    return sorted(
+        result,
+        key=lambda row: (
+            row.get("文件名", ""), int(float(row.get("页码", "0") or 0)),
+            row.get("关键词", ""),
+        ),
+    )
+
+
 def merged_rows(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     decorated: list[dict[str, str]] = []
     for source in rows:
@@ -364,18 +429,11 @@ def current_result_view(
     p_done = len(state.get("paddle_done", []))
     t_path = state_dir / "tesseract_raw.csv"
     p_path = state_dir / "paddle_raw.csv"
-    # The normal order is Tesseract then Paddle. Even while Paddle gradually
-    # produces raw hits, keep the completed first-engine view stable until the
-    # final merge file appears, as requested.
-    if t_done or t_path.is_file():
-        return provisional_rows(read_csv_rows(t_path), "tesseract"), (
-            "Tesseract 阶段结果（非最终，等待双引擎 merge）"
-        ), False, run_dir
-    if p_done or p_path.is_file():
-        return provisional_rows(read_csv_rows(p_path), "paddle"), (
-            "PaddleOCR 阶段结果（非最终，等待双引擎 merge）"
-        ), False, run_dir
-    return [], "等待首个引擎产生结果", False, run_dir
+    if t_done or p_done or t_path.is_file() or p_path.is_file():
+        return parallel_provisional_rows(
+            read_csv_rows(t_path), read_csv_rows(p_path)
+        ), "双引擎实时原始命中汇总（非最终）", False, run_dir
+    return [], "等待当前文件完成并写入首批原始命中", False, run_dir
 
 
 def filter_rows(
@@ -657,6 +715,11 @@ def start_ocr(input_root: Path, output_root: Path, keywords: str, dpi: int, bina
     child_env = os.environ.copy()
     child_env["PYTHONUTF8"] = "1"
     child_env["PYTHONIOENCODING"] = "utf-8"
+    # Do not flash a stale progress card during the short child-startup gap.
+    try:
+        (output_root / ".cma_ocr_resume" / "parallel_progress.json").unlink(missing_ok=True)
+    except OSError:
+        pass
     # Inherit the launcher CMD window.  The full desktop-style file progress,
     # page progress, heartbeat and error lines remain visible there; the web
     # page is deliberately only the compact companion view.
@@ -683,8 +746,11 @@ def start_ocr(input_root: Path, output_root: Path, keywords: str, dpi: int, bina
 
 
 def main() -> None:
-    st.title("CMA 双模型 OCR · 本地网页版")
-    st.caption("PDF 和识别结果仅保留在本机；关闭浏览器标签页不会停止后台 OCR。")
+    st.title(f"扫描 PDF 关键词检索 · 双引擎并行版 v{APP_VERSION}")
+    st.caption(
+        "同一页仅渲染一次，Tesseract 与 PaddleOCR 独立并行；"
+        "PDF 和结果始终保留在本机。"
+    )
 
     with st.sidebar:
         st.header("任务设置")
@@ -693,7 +759,7 @@ def main() -> None:
         output_text = st.text_input("结果保存文件夹", placeholder=r"D:\OCR_Results")
         dpi = st.number_input("渲染 DPI", min_value=200, max_value=600, value=400, step=25)
         binarize = st.checkbox("Tesseract 二值化", value=False)
-        auto_refresh = st.checkbox("任务运行时自动更新（每 10 秒）", value=True)
+        auto_refresh = st.checkbox("任务运行时自动更新（每 8 秒）", value=True)
         start_clicked = st.button("开始后台 OCR", type="primary", use_container_width=True)
         st.button("立即刷新当前页面", use_container_width=True)
 
@@ -736,14 +802,12 @@ def main() -> None:
     trusted_rows = display_rows if has_final_merge else []
     candidate_rows = read_csv_rows(result_root / "cma_results_candidates.csv")
     error_rows = read_csv_rows(result_root / "cma_results_errors.csv")
-    paddle_status = read_paddle_worker_status(output_root, is_running)
-    worker_log_path = paddle_worker_log_path(run_dir)
-    worker_log_text = read_tail(worker_log_path, lines=300) if worker_log_path else ""
+    parallel_progress = read_parallel_progress(output_root, is_running)
 
     # Do not refresh a finished/history view: filters and selected rows stay
     # still unless the user explicitly requests a refresh.
     if auto_refresh and is_running:
-        st_autorefresh(interval=10000, key="cma_ocr_auto_refresh")
+        st_autorefresh(interval=8000, key="cma_parallel_auto_refresh")
 
     status = "正在运行" if is_running else ("已结束或未启动" if job else "未发现任务记录")
     metric1, metric2, metric3, metric4 = st.columns(4)
@@ -752,48 +816,99 @@ def main() -> None:
     metric3.metric("结果阶段", "最终 merge" if has_final_merge else "阶段性")
     metric4.metric("错误记录", len(error_rows))
     st.caption(f"当前数据源：{result_mode}")
-    progress = parse_progress(log_text, resume_state, paddle_status)
-    st.subheader("识别进展")
-    progress_left, progress_mid, progress_right, progress_last = st.columns(4)
-    engine_value = str(progress["engine"] or "").casefold()
-    if engine_value == "tesseract":
-        phase_name = "Tesseract（1 / 2）"
-    elif engine_value == "paddle":
-        phase_name = "PaddleOCR（2 / 2）"
+    st.subheader("双引擎识别进展")
+    if parallel_progress:
+        file_total = int(parallel_progress.get("file_total", 0) or 0)
+        completed_files = int(parallel_progress.get("completed_files", 0) or 0)
+        file_index = int(parallel_progress.get("file_index", 0) or 0)
+        page = int(parallel_progress.get("page", 0) or 0)
+        page_total = int(parallel_progress.get("page_total", 0) or 0)
+        filename = str(parallel_progress.get("current_file", "") or "正在初始化")
+        updated_epoch = float(parallel_progress.get("updated_epoch", 0) or 0)
+        seconds_since_update = max(0, int(time.time() - updated_epoch)) if updated_epoch else 0
+        heartbeat = int(parallel_progress.get("heartbeat", 0) or 0)
+
+        overview_a, overview_b, overview_c, overview_d = st.columns(4)
+        overview_a.metric("已完整完成文件", f"{completed_files} / {file_total or '-'}")
+        overview_b.metric("正在处理", f"第 {file_index} 份" if file_index else "初始化")
+        overview_c.metric("共享页进度", f"{page or '-'} / {page_total or '-'}")
+        overview_d.metric(
+            "状态心跳",
+            f"#{heartbeat} · {seconds_since_update} 秒前更新" if heartbeat else f"{seconds_since_update} 秒前更新",
+        )
+        if file_total:
+            st.progress(
+                min(1.0, completed_files / file_total),
+                text=(
+                    f"文件总进度 {completed_files}/{file_total}｜当前：{filename}｜"
+                    "本文件两个模型都完成后才会 +1"
+                ),
+            )
+        if page_total:
+            st.progress(
+                min(1.0, page / page_total),
+                text=f"当前文件共享页面 {page}/{page_total}｜{filename}",
+            )
+        else:
+            st.info(f"当前文件：{filename}")
+
+        state_labels = {
+            "initializing": "初始化中", "ready": "已就绪", "waiting": "等待共享渲染",
+            "rendering": "共享渲染中", "working": "识别中", "page_done": "本页已完成",
+            "rechecking": "500 DPI 二次精查", "recheck_done": "二次精查完成",
+            "file_done": "本文件已完成", "unavailable": "不可用", "error": "本页异常",
+        }
+        engines = parallel_progress.get("engines", {})
+        engine_columns = st.columns(2)
+        for column, engine_key, engine_title in zip(
+            engine_columns,
+            ("tesseract", "paddle"),
+            ("Tesseract", "PaddleOCR"),
+        ):
+            engine = engines.get(engine_key, {}) if isinstance(engines, dict) else {}
+            engine_state = str(engine.get("state", "initializing"))
+            engine_page = int(engine.get("page", 0) or 0)
+            engine_total = int(engine.get("page_total", 0) or 0)
+            engine_elapsed = float(engine.get("elapsed", 0) or 0)
+            with column:
+                with st.container(border=True):
+                    st.markdown(f"#### {engine_title}")
+                    card_a, card_b = st.columns(2)
+                    card_a.metric("当前状态", state_labels.get(engine_state, engine_state))
+                    card_b.metric("模型页进度", f"{engine_page or '-'} / {engine_total or '-'}")
+                    if engine_total:
+                        st.progress(min(1.0, engine_page / engine_total))
+                    message = str(engine.get("message", "") or "等待状态")
+                    if engine_elapsed:
+                        st.caption(f"{message}｜本次识别 {engine_elapsed:.1f} 秒")
+                    else:
+                        st.caption(message)
+
+        t_state = str((engines.get("tesseract", {}) if isinstance(engines, dict) else {}).get("state", ""))
+        p_state = str((engines.get("paddle", {}) if isinstance(engines, dict) else {}).get("state", ""))
+        t_ok = t_state == "file_done"
+        p_ok = p_state == "file_done"
+        if t_ok and p_ok:
+            st.success("文件完成门槛：Tesseract ✓ + PaddleOCR ✓；已保存两套独立原始结果。")
+        elif "unavailable" in (t_state, p_state):
+            st.error("当前不是完整双引擎任务：至少一个模型不可用。建议检查后重新运行。")
+        else:
+            st.info(
+                "文件完成门槛："
+                f"Tesseract {'✓' if t_ok else '处理中'} + "
+                f"PaddleOCR {'✓' if p_ok else '处理中'}；未会合前不会进入下一份文件。"
+            )
+        events = parallel_progress.get("recent_events", [])
+        if isinstance(events, list) and events:
+            st.caption("最近事件：" + "　｜　".join(str(item) for item in events[-3:]))
     else:
-        phase_name = str(progress["phase"] or "等待启动")
-    progress_left.metric("当前阶段", phase_name)
-    file_index = progress["file_index"]
-    file_total = progress["file_total"]
-    page = progress["page"]
-    page_total = progress["page_total"]
-    shown_file_index = file_index if isinstance(file_index, int) else "-"
-    shown_file_total = file_total if isinstance(file_total, int) else "-"
-    shown_page = page if isinstance(page, int) else "-"
-    shown_page_total = page_total if isinstance(page_total, int) else "-"
-    progress_mid.metric("文件进度", f"{shown_file_index} / {shown_file_total}")
-    progress_right.metric("当前页", f"{shown_page} / {shown_page_total}")
-    heartbeat = progress["heartbeat"]
-    elapsed = progress["elapsed"]
-    heartbeat_scope = str(progress["heartbeat_scope"] or "活动")
-    if heartbeat is None:
-        heartbeat_text = "等待心跳"
-    elif isinstance(elapsed, (int, float)):
-        heartbeat_text = f"{heartbeat_scope} #{heartbeat} · {elapsed:.0f} 秒"
-    else:
-        heartbeat_text = f"{heartbeat_scope} #{heartbeat}"
-    progress_last.metric("活动心跳", heartbeat_text)
-    worker_stage = str(progress.get("worker_stage") or "")
-    filename = str(progress["filename"] or worker_stage or "等待任务开始")
-    if isinstance(file_index, int) and isinstance(file_total, int) and file_total > 0:
-        file_fraction = min(1.0, max(0.0, file_index / file_total))
-        st.progress(file_fraction, text=f"{phase_name}｜文件进度 {file_index}/{file_total}")
-    if isinstance(page, int) and isinstance(page_total, int) and page_total > 0:
-        page_fraction = min(1.0, max(0.0, page / page_total))
-        st.progress(page_fraction, text=f"当前文件：{filename} ｜第 {page}/{page_total} 页")
-    else:
-        st.info(f"当前文件：{filename}")
-    st.caption(f"最近事件：{short_event(progress['event'] if isinstance(progress['event'], str) else None)}")
+        # The compact file may not exist during the first seconds of process
+        # startup or after a successful run clears its resume directory.
+        fallback = parse_progress(log_text, resume_state, {})
+        st.info(
+            "正在等待并行状态文件；若任务刚启动，这是模型初始化阶段。"
+            f" 最近日志：{short_event(fallback.get('event') if isinstance(fallback.get('event'), str) else None)}"
+        )
     if job:
         st.caption(
             f"开始时间：{job.get('started_at', '-')}　关键词：{job.get('keywords', '-')}　"
@@ -884,13 +999,9 @@ def main() -> None:
     )
 
     with st.expander("完整排错日志（按需展开）", expanded=False):
-        st.caption("主进程 / Tesseract / Paddle 心跳日志")
+        st.caption("CMD 控制台仍保留完整文件进度、页级进度、双引擎心跳和错误信息。")
         st.code(log_text, language="text")
-        if worker_log_text:
-            st.caption("PaddleOCR 子进程详细页级日志")
-            st.code(worker_log_text, language="text")
 
 
 if __name__ == "__main__":
     main()
-

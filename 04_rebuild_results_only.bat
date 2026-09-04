@@ -16,7 +16,7 @@ if not defined BASE_PY (
     )
 )
 
-set "OCR_SCRIPT=%~dp0cma_dual_keyword_enhanced.py"
+set "OCR_SCRIPT=%~dp0cma_dual_keyword_parallel.py"
 if not defined BASE_PY (
     echo [ERROR] Python was not found. Install Anaconda Python first.
     goto :failed
@@ -44,4 +44,3 @@ echo Keep this window open and copy its complete output for diagnosis.
 popd
 pause
 exit /b 1
-

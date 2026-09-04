@@ -7,6 +7,7 @@ import gc
 import hashlib
 import json
 import logging
+import multiprocessing as mp
 import os
 import queue
 import re
@@ -254,6 +255,9 @@ _report_paddle_worker_stage("隔离解释器已启动，正在导入 OCR 依赖"
 # These flags must be set before PaddleOCR is imported.
 os.environ.setdefault("FLAGS_use_mkldnn", "0")
 os.environ.setdefault("FLAGS_use_onednn", "0")
+# Tesseract 官方建议批量任务使用多个单线程实例，避免 OpenMP 在单页上
+# 抢占全部核心。并行版给 Paddle 留出 3 个线程，Tesseract 固定 1 线程。
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 
 import numpy as np
 try:
@@ -268,16 +272,55 @@ _report_paddle_worker_stage("基础依赖导入完成，等待初始化 PaddleOC
 
 
 # ============================== Configuration ==============================
-# Tesseract 支持显式环境变量、Windows 常见安装位置以及 PATH 自动查找。
-TESSERACT_EXE_CANDIDATES = [
-    *(
-        [Path(os.environ["TESSERACT_CMD"]).expanduser()]
-        if os.environ.get("TESSERACT_CMD")
-        else []
-    ),
-    Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
-    Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
-]
+# Tesseract 是 pytesseract 之外的独立程序。除显式环境变量和 Windows
+# 标准安装位置外，还要检查 Conda 环境、用户安装目录和程序旁的便携版。
+def _build_tesseract_candidates() -> list[Path]:
+    script_dir = Path(__file__).resolve().parent
+    python_prefix = Path(sys.prefix).resolve()
+    candidates: list[Path] = []
+    if os.environ.get("TESSERACT_CMD"):
+        candidates.append(Path(os.environ["TESSERACT_CMD"]).expanduser())
+    candidates.extend([
+        script_dir / "Tesseract-OCR" / "tesseract.exe",
+        script_dir / "tools" / "Tesseract-OCR" / "tesseract.exe",
+        script_dir / "tesseract" / "tesseract.exe",
+        python_prefix / "Library" / "bin" / "tesseract.exe",
+        python_prefix / "Scripts" / "tesseract.exe",
+        python_prefix / "tesseract.exe",
+        Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
+        # Kept for compatibility with installations placed on a secondary drive.
+        Path(r"D:\Program Files\Tesseract-OCR\tesseract.exe"),
+        Path(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
+        Path(r"D:\Program Files (x86)\Tesseract-OCR\tesseract.exe"),
+    ])
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        local_root = Path(local_app_data)
+        candidates.extend([
+            local_root / "Programs" / "Tesseract-OCR" / "tesseract.exe",
+            local_root / "Tesseract-OCR" / "tesseract.exe",
+        ])
+
+    # If environments were unified after an older install, a still-existing
+    # sibling Conda environment may contain the executable and its DLLs.
+    envs_root = python_prefix.parent if python_prefix.parent.name.lower() == "envs" else None
+    if envs_root is not None and envs_root.is_dir():
+        try:
+            candidates.extend(envs_root.glob("*/Library/bin/tesseract.exe"))
+        except OSError:
+            pass
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = os.path.normcase(os.path.abspath(str(candidate)))
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+TESSERACT_EXE_CANDIDATES = _build_tesseract_candidates()
 TESS_LANG = "chi_sim+eng"
 TESS_CONFIG = "--oem 3 --psm 3 -c preserve_interword_spaces=1"
 PADDLE_LANG = "ch"
@@ -299,6 +342,11 @@ MEMORY_FALLBACK_DPI = (300, 250)
 # Paddle 阶段每个独立子进程处理的文件数：子进程退出后操作系统强制回收其
 # C++ 内存池（进程内 del/gc 无法释放）。批次越小越省内存、但重启开销越大。
 PADDLE_BATCH_SIZE = 8
+# PaddleOCR 2.x 官方默认识别批量为 6。旧版为了保守设置成 1，会让一页中
+# 大量文字框逐个进入识别器。批量只改变调度，不改变检测框、模型或关键词规则。
+PADDLE_REC_BATCH_NUM = 6
+PADDLE_CPU_THREADS = 3
+PARALLEL_PAGE_BUFFER = 1
 # 续跑状态目录名（相对 output_base），用于崩溃后断点续跑。
 STATE_DIR_NAME = ".cma_ocr_resume"
 
@@ -451,20 +499,50 @@ def configure_worker_logging(log_path: Path) -> None:
     )
 
 
-def configure_tesseract() -> None:
+def configure_tesseract() -> Path:
+    selected: Path | None = None
     for candidate in TESSERACT_EXE_CANDIDATES:
         if candidate.is_file():
-            pytesseract.pytesseract.tesseract_cmd = str(candidate)
-            return
-    discovered = shutil.which("tesseract")
-    if discovered:
-        pytesseract.pytesseract.tesseract_cmd = discovered
-        return
-    searched = "；".join(str(c) for c in TESSERACT_EXE_CANDIDATES)
-    raise FileNotFoundError(
-        f"未找到 Tesseract。已尝试：{searched}；以及系统 PATH。"
-        "请确认已安装并勾选中文语言包。"
-    )
+            selected = candidate.resolve()
+            break
+    if selected is None:
+        discovered = shutil.which("tesseract")
+        if discovered:
+            selected = Path(discovered).resolve()
+    if selected is None:
+        searched = "；".join(str(c) for c in TESSERACT_EXE_CANDIDATES)
+        raise FileNotFoundError(
+            f"未找到 Tesseract 主程序。已尝试：{searched}；以及系统 PATH。"
+            "pytesseract 只是 Python 调用组件，不能代替 tesseract.exe。"
+        )
+
+    pytesseract.pytesseract.tesseract_cmd = str(selected)
+    if not os.environ.get("TESSDATA_PREFIX"):
+        tessdata_candidates = [
+            selected.parent / "tessdata",
+            selected.parent.parent / "share" / "tessdata",
+            Path(sys.prefix) / "Library" / "share" / "tessdata",
+            Path(sys.prefix) / "share" / "tessdata",
+        ]
+        for tessdata_dir in tessdata_candidates:
+            if (tessdata_dir / "chi_sim.traineddata").is_file():
+                os.environ["TESSDATA_PREFIX"] = str(tessdata_dir.resolve())
+                break
+
+    try:
+        available_languages = set(pytesseract.get_languages(config=""))
+    except Exception as exc:
+        raise RuntimeError(
+            f"已找到 Tesseract，但无法启动：{selected}；{type(exc).__name__}: {exc}"
+        ) from exc
+    missing_languages = {"chi_sim", "eng"} - available_languages
+    if missing_languages:
+        tessdata_hint = os.environ.get("TESSDATA_PREFIX", str(selected.parent / "tessdata"))
+        raise RuntimeError(
+            f"Tesseract 缺少语言包：{', '.join(sorted(missing_languages))}。"
+            f"请把对应 .traineddata 文件放入：{tessdata_hint}"
+        )
+    return selected
 
 
 def init_paddle() -> Any | None:
@@ -487,13 +565,25 @@ def init_paddle() -> Any | None:
 
         # PaddleOCR 2.7 uses use_angle_cls/cls, not the 3.x
         # use_textline_orientation/predict interface.
+        model_kwargs: dict[str, str] = {}
+        custom_model_root = os.environ.get("CMA_PADDLE_MODEL_ROOT", "").strip()
+        if custom_model_root:
+            model_root = Path(custom_model_root).expanduser().resolve()
+            model_kwargs = {
+                "det_model_dir": str(model_root / "det"),
+                "rec_model_dir": str(model_root / "rec"),
+                "cls_model_dir": str(model_root / "cls"),
+            }
+            logging.info("Paddle 模型缓存：%s", model_root)
         return PaddleOCR(
             lang=PADDLE_LANG,
             use_angle_cls=True,
             use_gpu=False,
             enable_mkldnn=False,
-            rec_batch_num=1,
+            cpu_threads=PADDLE_CPU_THREADS,
+            rec_batch_num=PADDLE_REC_BATCH_NUM,
             show_log=False,
+            **model_kwargs,
         )
     except Exception as exc:
         logging.exception("PaddleOCR 初始化失败；Tesseract 结果仍会保留：%s", exc)
@@ -1573,6 +1663,862 @@ def run_paddle_isolated(
     return aggregate, paddle_ran
 
 
+# ======================== Parallel render-once pipeline ====================
+# The stable edition above remains available for rollback.  The experimental
+# edition below renders each PDF page once, writes one short-lived lossless RGB
+# cache, and lets two independent long-lived processes read the same pixels.
+# A raw cache file is used instead of Queue pickling / shared_memory because it
+# is predictable on Python 3.10 for long Windows runs and is removed per page.
+
+
+def _parallel_engine_worker(
+    engine_name: str,
+    task_queue: Any,
+    result_queue: Any,
+    log_path_text: str,
+) -> None:
+    """Independent OCR process consuming immutable lossless page caches."""
+    log_path = Path(log_path_text)
+    configure_worker_logging(log_path)
+    engine: Any = None
+    try:
+        if engine_name == "tesseract":
+            configure_tesseract()
+        elif engine_name == "paddle":
+            engine = init_paddle()
+            if engine is None:
+                raise RuntimeError("PaddleOCR 初始化失败")
+            # PaddleOCR may replace the root logger during construction.
+            configure_worker_logging(log_path)
+        else:
+            raise ValueError(f"未知 OCR 引擎：{engine_name}")
+        result_queue.put({"kind": "ready", "engine": engine_name, "ok": True})
+    except BaseException as exc:  # noqa: BLE001 - report worker bootstrap failure
+        result_queue.put({
+            "kind": "ready",
+            "engine": engine_name,
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+        return
+
+    while True:
+        task = task_queue.get()
+        if task is None or task.get("kind") == "stop":
+            break
+        task_id = str(task.get("task_id", "-"))
+        cache_path = Path(task["cache_path"])
+        mapped: Any = None
+        image: Image.Image | None = None
+        try:
+            shape = tuple(int(value) for value in task["shape"])
+            dtype = np.dtype(task.get("dtype", "uint8"))
+            mapped = np.memmap(cache_path, dtype=dtype, mode="r", shape=shape)
+            # Each worker receives a private copy. OCR text, confidence, retry
+            # state and output remain independent; only immutable pixels match.
+            private_pixels = np.array(mapped, copy=True)
+            image = Image.fromarray(private_pixels, mode="RGB")
+            image.info["render_dpi"] = int(task["dpi"])
+            del private_pixels
+            if task.get("recheck"):
+                ocr_function = (
+                    ocr_tesseract_recheck
+                    if engine_name == "tesseract"
+                    else ocr_paddle_recheck
+                )
+                display_name = f"{engine_name}-复核"
+            else:
+                ocr_function = ocr_tesseract if engine_name == "tesseract" else ocr_paddle
+                display_name = engine_name
+            text, elapsed = run_ocr_with_heartbeat(
+                ocr_function,
+                image,
+                engine,
+                display_name,
+                str(task["filename"]),
+                int(task["page"]),
+            )
+            result_queue.put({
+                "kind": "result",
+                "engine": engine_name,
+                "task_id": task_id,
+                "ok": True,
+                "text": text,
+                "elapsed": elapsed,
+            })
+        except BaseException as exc:  # noqa: BLE001 - parent owns retry policy
+            result_queue.put({
+                "kind": "result",
+                "engine": engine_name,
+                "task_id": task_id,
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+        finally:
+            if image is not None:
+                image.close()
+            if mapped is not None:
+                del mapped
+
+
+def _start_parallel_worker(engine_name: str, log_path: Path) -> dict[str, Any]:
+    context = mp.get_context("spawn")
+    task_queue = context.Queue(maxsize=PARALLEL_PAGE_BUFFER + 1)
+    result_queue = context.Queue(maxsize=PARALLEL_PAGE_BUFFER + 1)
+    process = context.Process(
+        target=_parallel_engine_worker,
+        args=(engine_name, task_queue, result_queue, str(log_path)),
+        name=f"cma-{engine_name}-parallel",
+    )
+    process.start()
+    heartbeat = 0
+    while True:
+        try:
+            ready = result_queue.get(timeout=HEARTBEAT_SECONDS)
+        except queue.Empty:
+            heartbeat += 1
+            if not process.is_alive():
+                raise RuntimeError(
+                    f"{engine_name} 子进程启动时退出，exitcode={process.exitcode}"
+                )
+            logging.info(
+                "[%s 启动心跳#%d] PID=%d | 正在导入依赖或初始化模型",
+                engine_name, heartbeat, process.pid,
+            )
+            continue
+        if ready.get("kind") != "ready":
+            continue
+        if not ready.get("ok"):
+            process.join(timeout=5)
+            raise RuntimeError(str(ready.get("error", "未知初始化错误")))
+        logging.info("%s 并行子进程就绪 | PID=%d", engine_name, process.pid)
+        return {
+            "engine": engine_name,
+            "process": process,
+            "task_queue": task_queue,
+            "result_queue": result_queue,
+            "log_path": log_path,
+        }
+
+
+def _stop_parallel_worker(worker: dict[str, Any] | None) -> None:
+    if not worker:
+        return
+    process = worker.get("process")
+    try:
+        if process is not None and process.is_alive():
+            worker["task_queue"].put({"kind": "stop"})
+            process.join(timeout=30)
+        if process is not None and process.is_alive():
+            logging.warning("%s 子进程未正常退出，正在结束该测试子进程", worker["engine"])
+            process.terminate()
+            process.join(timeout=10)
+    except Exception:
+        logging.exception("停止 %s 子进程时发生异常", worker.get("engine", "unknown"))
+
+
+def _restart_parallel_worker(
+    workers: dict[str, dict[str, Any]],
+    engine_name: str,
+) -> bool:
+    old = workers.get(engine_name)
+    log_path = old["log_path"] if old else Path(f"{engine_name}_parallel_worker.log")
+    _stop_parallel_worker(old)
+    try:
+        workers[engine_name] = _start_parallel_worker(engine_name, log_path)
+        logging.info("%s 并行子进程已重新启动", engine_name)
+        return True
+    except Exception as exc:  # noqa: BLE001 - caller records engine error
+        workers.pop(engine_name, None)
+        logging.exception("%s 并行子进程重启失败：%s", engine_name, exc)
+        return False
+
+
+def _write_lossless_page_cache(
+    image: Image.Image,
+    cache_dir: Path,
+    token: str,
+) -> tuple[Path, dict[str, Any]]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    array = np.ascontiguousarray(np.asarray(image, dtype=np.uint8))
+    cache_path = cache_dir / f"{token}.rgb"
+    with cache_path.open("wb") as cache_file:
+        cache_file.write(array.tobytes(order="C"))
+        cache_file.flush()
+    payload = {
+        "cache_path": str(cache_path),
+        "shape": list(array.shape),
+        "dtype": str(array.dtype),
+        "dpi": int(image.info.get("render_dpi", RENDER_DPI)),
+    }
+    del array
+    return cache_path, payload
+
+
+def _execute_parallel_tasks(
+    workers: dict[str, dict[str, Any]],
+    engine_names: Iterable[str],
+    payload: dict[str, Any],
+    status_callback: Any = None,
+) -> dict[str, dict[str, Any]]:
+    """Submit one immutable page to independent workers and wait with heartbeat."""
+    requested = [name for name in engine_names if name in workers]
+    results: dict[str, dict[str, Any]] = {}
+    attempts = {name: 0 for name in requested}
+    task_ids: dict[str, str] = {}
+
+    def submit(name: str) -> None:
+        attempts[name] += 1
+        task_id = (
+            f"{os.getpid()}-{time.time_ns()}-{name}-"
+            f"{payload.get('page', 0)}-{attempts[name]}"
+        )
+        task_ids[name] = task_id
+        task = dict(payload)
+        task["task_id"] = task_id
+        workers[name]["task_queue"].put(task)
+        if status_callback is not None:
+            status_callback(
+                "submitted", name,
+                {"attempt": attempts[name], "recheck": bool(payload.get("recheck"))},
+            )
+
+    for name in requested:
+        submit(name)
+
+    pending = set(requested)
+    heartbeat_started = time.monotonic()
+    heartbeat = 0
+    while pending:
+        progressed = False
+        for name in list(pending):
+            worker = workers.get(name)
+            if worker is None:
+                results[name] = {
+                    "ok": False,
+                    "error": "子进程不可用",
+                    "attempts": attempts[name],
+                }
+                pending.remove(name)
+                if status_callback is not None:
+                    status_callback("failed", name, results[name])
+                continue
+            process = worker["process"]
+            if not process.is_alive():
+                logging.error(
+                    "%s 子进程意外退出 | exitcode=%s | 将重新启动并重试当前页",
+                    name, process.exitcode,
+                )
+                if attempts[name] < MAX_RETRIES and _restart_parallel_worker(workers, name):
+                    submit(name)
+                    progressed = True
+                    continue
+                results[name] = {
+                    "ok": False,
+                    "error": f"子进程退出，exitcode={process.exitcode}",
+                    "attempts": attempts[name],
+                }
+                pending.remove(name)
+                if status_callback is not None:
+                    status_callback("failed", name, results[name])
+                continue
+            try:
+                response = worker["result_queue"].get_nowait()
+            except queue.Empty:
+                continue
+            if response.get("kind") != "result" or response.get("task_id") != task_ids[name]:
+                continue
+            progressed = True
+            if response.get("ok"):
+                response["attempts"] = attempts[name]
+                results[name] = response
+                pending.remove(name)
+                if status_callback is not None:
+                    status_callback("completed", name, response)
+                continue
+            if attempts[name] < MAX_RETRIES:
+                logging.warning(
+                    "%s | %s | 第%s页 | 尝试%d/%d失败：%s",
+                    name, payload.get("filename"), payload.get("page"),
+                    attempts[name], MAX_RETRIES, response.get("error"),
+                )
+                time.sleep(RETRY_DELAY_SECONDS)
+                submit(name)
+            else:
+                response["attempts"] = attempts[name]
+                results[name] = response
+                pending.remove(name)
+                if status_callback is not None:
+                    status_callback("failed", name, response)
+
+        now = time.monotonic()
+        if pending and now - heartbeat_started >= HEARTBEAT_SECONDS:
+            heartbeat += 1
+            logging.info(
+                "[并行心跳#%d] 文件=%s | 页码=%s | 等待引擎=%s",
+                heartbeat,
+                payload.get("filename"),
+                payload.get("page"),
+                "+".join(sorted(pending)),
+            )
+            if status_callback is not None:
+                status_callback(
+                    "heartbeat", None,
+                    {"heartbeat": heartbeat, "pending": sorted(pending)},
+                )
+            heartbeat_started = now
+        if pending and not progressed:
+            time.sleep(0.1)
+    return results
+
+
+def _parallel_recheck_hits(initial_hits: list[Hit], recheck_text: str, keywords: list[str],
+                           filename: str, page_number: int, engine_name: str) -> list[Hit]:
+    recheck_hits = find_keyword_hits(
+        recheck_text, keywords, filename, page_number, engine_name, "ocr_recheck"
+    )
+    exact_keywords = {
+        normalize_for_comparison(hit.keyword)
+        for hit in recheck_hits
+        if hit.match_type == "exact_normalized"
+    }
+    if not exact_keywords:
+        return initial_hits
+    retained = [
+        hit for hit in initial_hits
+        if not (
+            hit.match_type in UNCERTAIN_MATCH_TYPES
+            and normalize_for_comparison(hit.keyword) in exact_keywords
+        )
+    ]
+    return retained + [
+        hit for hit in recheck_hits if hit.match_type == "exact_normalized"
+    ]
+
+
+def _render_once_with_retries(
+    page: fitz.Page,
+    relative_name: str,
+    page_number: int,
+    errors: list[PageError],
+    primary_dpi: int,
+) -> tuple[Image.Image | None, int]:
+    used_dpi = primary_dpi
+    for dpi in render_dpi_candidates(primary_dpi):
+        used_dpi = dpi
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                return render_page(page, dpi), dpi
+            except Exception as exc:  # noqa: BLE001 - keep all pages moving
+                memory_failure = is_memory_error(exc)
+                errors.append(PageError(
+                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+                    engine="renderer",
+                    filename=relative_name,
+                    page=page_number,
+                    attempt=attempt,
+                    stage="内存降级重试" if memory_failure else "页面渲染",
+                    message=f"DPI={dpi} | {type(exc).__name__}: {exc}",
+                ))
+                if memory_failure:
+                    break
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY_SECONDS)
+        if dpi == render_dpi_candidates(primary_dpi)[-1]:
+            break
+    return None, used_dpi
+
+
+def run_parallel_engines(
+    pdf_files: list[tuple[Path, str]],
+    keywords: list[str],
+    errors: list[PageError],
+    tesseract_raw_path: Path,
+    paddle_raw_path: Path,
+    state_dir: Path,
+    output_dir: Path,
+    tesseract_available: bool,
+) -> tuple[dict[str, int] | None, dict[str, int] | None, bool]:
+    """Render once and process each file with two equal, isolated OCR workers."""
+    state = _load_state(state_dir)
+    stats: dict[str, dict[str, int]] = {
+        name: {
+            "pages": 0, "text": 0, "empty": 0, "error": 0,
+            "fallback": 0, "skipped_files": 0,
+        }
+        for name in ("tesseract", "paddle")
+    }
+    done = {
+        name: set(state.get(f"{name}_done", []))
+        for name in ("tesseract", "paddle")
+    }
+    dual_completed = sum(
+        1 for _path, relative_name in pdf_files
+        if relative_name in done["tesseract"] and relative_name in done["paddle"]
+    )
+    progress_state: dict[str, Any] = {
+        "version": 1,
+        "mode": "parallel_render_once",
+        "overall_state": "initializing",
+        "file_total": len(pdf_files),
+        "completed_files": dual_completed,
+        "file_index": min(len(pdf_files), dual_completed + 1) if pdf_files else 0,
+        "current_file": "",
+        "page": 0,
+        "page_total": 0,
+        "page_complete": False,
+        "file_complete": False,
+        "heartbeat": 0,
+        "engines": {
+            "tesseract": {"state": "initializing", "page": 0, "page_total": 0,
+                          "elapsed": 0.0, "message": "正在启动独立子进程"},
+            "paddle": {"state": "initializing", "page": 0, "page_total": 0,
+                       "elapsed": 0.0, "message": "正在加载模型"},
+        },
+        "recent_events": ["正在初始化双引擎"],
+    }
+
+    def publish(event: str | None = None) -> None:
+        if event:
+            events = list(progress_state.get("recent_events", []))
+            events.append(event)
+            progress_state["recent_events"] = events[-6:]
+        _write_parallel_progress(state_dir, progress_state)
+
+    publish()
+    raw_paths = {"tesseract": tesseract_raw_path, "paddle": paddle_raw_path}
+    cache_dir = state_dir / "parallel_page_cache"
+    shutil.rmtree(cache_dir, ignore_errors=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    workers: dict[str, dict[str, Any]] = {}
+    if tesseract_available:
+        try:
+            workers["tesseract"] = _start_parallel_worker(
+                "tesseract", output_dir / f"{OUTPUT_PREFIX}_tesseract_worker.log"
+            )
+            progress_state["engines"]["tesseract"].update(
+                state="ready", message="独立子进程已就绪"
+            )
+            publish("Tesseract 子进程已就绪")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(PageError(
+                timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+                engine="tesseract", filename="-", page="-", attempt="-",
+                stage="并行子进程初始化", message=f"{type(exc).__name__}: {exc}",
+            ))
+            logging.exception("Tesseract 并行子进程初始化失败：%s", exc)
+            progress_state["engines"]["tesseract"].update(
+                state="unavailable", message=f"初始化失败：{type(exc).__name__}: {exc}"
+            )
+            publish("Tesseract 初始化失败，当前任务不再是完整双引擎")
+    else:
+        progress_state["engines"]["tesseract"].update(
+            state="unavailable", message="未检测到可用的 Tesseract"
+        )
+        publish("未检测到可用的 Tesseract")
+    try:
+        workers["paddle"] = _start_parallel_worker(
+            "paddle", output_dir / f"{OUTPUT_PREFIX}_paddle_worker.log"
+        )
+        progress_state["engines"]["paddle"].update(
+            state="ready", message="模型加载完成，独立子进程已就绪"
+        )
+        publish("PaddleOCR 子进程已就绪")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(PageError(
+            timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+            engine="paddle", filename="-", page="-", attempt="-",
+            stage="并行子进程初始化", message=f"{type(exc).__name__}: {exc}",
+        ))
+        logging.exception("Paddle 并行子进程初始化失败：%s", exc)
+        progress_state["engines"]["paddle"].update(
+            state="unavailable", message=f"初始化失败：{type(exc).__name__}: {exc}"
+        )
+        publish("PaddleOCR 初始化失败，当前任务不再是完整双引擎")
+
+    paddle_files_since_restart = 0
+    paddle_ran = "paddle" in workers
+    logging.info(
+        "========== 单次渲染双进程阶段开始 | 可用引擎=%s | Paddle批量=%d | "
+        "Paddle线程=%d | Tesseract线程=1 ==========" ,
+        "+".join(sorted(workers)) or "无", PADDLE_REC_BATCH_NUM, PADDLE_CPU_THREADS,
+    )
+    progress_state["overall_state"] = "running" if workers else "failed"
+    publish("双引擎并行阶段开始" if len(workers) == 2 else "降级识别阶段开始")
+
+    try:
+        for file_index, (pdf_path, relative_name) in enumerate(pdf_files, 1):
+            active = [
+                name for name in ("tesseract", "paddle")
+                if name in workers and relative_name not in done[name]
+            ]
+            for name in ("tesseract", "paddle"):
+                if relative_name in done[name]:
+                    stats[name]["skipped_files"] += 1
+            if not active:
+                logging.info("[%d/%d] 跳过（双引擎均已完成） %s", file_index, len(pdf_files), relative_name)
+                dual_completed = sum(
+                    1 for _path, name_in_manifest in pdf_files
+                    if name_in_manifest in done["tesseract"]
+                    and name_in_manifest in done["paddle"]
+                )
+                progress_state.update(
+                    completed_files=dual_completed,
+                    file_index=file_index,
+                    current_file=relative_name,
+                    file_complete=True,
+                )
+                publish(f"续跑跳过已由双引擎完成的文件：{relative_name}")
+                continue
+
+            file_hits: dict[str, list[Hit]] = {name: [] for name in active}
+            file_open_failed = False
+            logging.info(
+                "[%d/%d] %s | 本文件并行引擎=%s",
+                file_index, len(pdf_files), relative_name, "+".join(active),
+            )
+            progress_state.update(
+                file_index=file_index,
+                current_file=relative_name,
+                page=0,
+                page_total=0,
+                page_complete=False,
+                file_complete=False,
+            )
+            for name in ("tesseract", "paddle"):
+                if relative_name in done[name]:
+                    progress_state["engines"][name].update(
+                        state="file_done", page=0, page_total=0,
+                        elapsed=0.0, message="该引擎已在此前运行中完成本文件",
+                    )
+                elif name in workers:
+                    progress_state["engines"][name].update(
+                        state="waiting", page=0, page_total=0,
+                        elapsed=0.0, message="等待第 1 页共享渲染",
+                    )
+            publish(f"开始文件 {file_index}/{len(pdf_files)}：{relative_name}")
+            try:
+                with fitz.open(pdf_path) as document:
+                    total_pages = len(document)
+                    progress_state["page_total"] = total_pages
+                    for name in active:
+                        progress_state["engines"][name]["page_total"] = total_pages
+                    publish()
+                    for page_index, page in enumerate(document):
+                        page_number = page_index + 1
+                        progress_state.update(page=page_number, page_complete=False)
+                        for name in active:
+                            progress_state["engines"][name].update(
+                                state="rendering", page=page_number,
+                                page_total=total_pages, elapsed=0.0,
+                                message="等待共享无损页面渲染",
+                            )
+                        publish()
+                        image, used_dpi = _render_once_with_retries(
+                            page, relative_name, page_number, errors, RENDER_DPI
+                        )
+                        if image is None:
+                            fallback = page.get_text("text").strip() if USE_PDF_TEXT_AS_FALLBACK else ""
+                            for name in active:
+                                stats[name]["pages"] += 1
+                                if fallback:
+                                    stats[name]["text"] += 1
+                                    file_hits[name].extend(find_keyword_hits(
+                                        fallback, keywords, relative_name, page_number,
+                                        name, "pdf_text_fallback",
+                                    ))
+                                else:
+                                    stats[name]["error"] += 1
+                                progress_state["engines"][name].update(
+                                    state="page_done", page=page_number,
+                                    page_total=total_pages, elapsed=0.0,
+                                    message="渲染失败，已完成文本层回退",
+                                )
+                            progress_state["page_complete"] = True
+                            publish(f"第 {page_number}/{total_pages} 页已完成（文本层回退）")
+                            _print_progress(file_index, len(pdf_files), page_number, total_pages, relative_name)
+                            continue
+
+                        cache_path: Path | None = None
+                        try:
+                            token = f"{os.getpid()}_{file_index}_{page_number}_{used_dpi}"
+                            cache_path, payload = _write_lossless_page_cache(image, cache_dir, token)
+                            payload.update({
+                                "kind": "ocr",
+                                "filename": relative_name,
+                                "page": page_number,
+                                "recheck": False,
+                            })
+
+                            page_started = time.monotonic()
+
+                            def page_status(event: str, engine_name: str | None,
+                                            details: dict[str, Any]) -> None:
+                                if event == "heartbeat":
+                                    progress_state["heartbeat"] = int(details.get("heartbeat", 0))
+                                    pending_names = set(details.get("pending", []))
+                                    for pending_name in pending_names:
+                                        progress_state["engines"][pending_name].update(
+                                            state="rechecking" if payload.get("recheck") else "working",
+                                            elapsed=round(time.monotonic() - page_started, 1),
+                                            message="仍在二次精查" if payload.get("recheck") else "仍在识别当前页",
+                                        )
+                                    publish()
+                                    return
+                                if not engine_name:
+                                    return
+                                engine_progress = progress_state["engines"][engine_name]
+                                if event == "submitted":
+                                    engine_progress.update(
+                                        state="rechecking" if details.get("recheck") else "working",
+                                        elapsed=0.0,
+                                        message="正在二次精查" if details.get("recheck") else "正在识别当前页",
+                                    )
+                                elif event == "completed":
+                                    engine_progress.update(
+                                        state="recheck_done" if payload.get("recheck") else "page_done",
+                                        elapsed=round(float(details.get("elapsed", 0.0)), 1),
+                                        message=("二次精查已完成" if payload.get("recheck") else
+                                                 "本页已完成，等待另一引擎"),
+                                    )
+                                else:
+                                    engine_progress.update(
+                                        state="error", message=str(details.get("error", "当前页识别失败"))
+                                    )
+                                publish()
+
+                            page_results = _execute_parallel_tasks(
+                                workers, active, payload, page_status
+                            )
+                        finally:
+                            image.close()
+                            if cache_path is not None:
+                                cache_path.unlink(missing_ok=True)
+
+                        fallback_text: str | None = None
+                        page_hits_by_engine: dict[str, list[Hit]] = {}
+                        uncertain_engines: list[str] = []
+                        for name in active:
+                            result = page_results.get(name, {"ok": False, "error": "没有返回结果"})
+                            page_error = not bool(result.get("ok"))
+                            page_text = str(result.get("text", "")) if result.get("ok") else ""
+                            if result.get("ok") and float(result.get("elapsed", 0.0)) > SLOW_PAGE_WARNING_SECONDS:
+                                logging.warning(
+                                    "%s | %s | 第%d页耗时 %.1fs | 共享DPI=%d",
+                                    name, relative_name, page_number,
+                                    float(result.get("elapsed", 0.0)), used_dpi,
+                                )
+                            text_origin = "ocr"
+                            if usable_character_count(page_text) < MIN_OCR_TEXT_LENGTH and USE_PDF_TEXT_AS_FALLBACK:
+                                if fallback_text is None:
+                                    fallback_text = page.get_text("text").strip()
+                                if usable_character_count(fallback_text) > usable_character_count(page_text):
+                                    page_text = fallback_text
+                                    text_origin = "pdf_text_fallback"
+                            hits = find_keyword_hits(
+                                page_text, keywords, relative_name, page_number, name, text_origin
+                            )
+                            page_hits_by_engine[name] = hits
+                            if SUSPECT_RECHECK_ENABLED and any(
+                                hit.match_type in UNCERTAIN_MATCH_TYPES for hit in hits
+                            ):
+                                uncertain_engines.append(name)
+                            stats[name]["pages"] += 1
+                            if used_dpi != RENDER_DPI:
+                                stats[name]["fallback"] += 1
+                            if page_text:
+                                stats[name]["text"] += 1
+                            elif page_error:
+                                stats[name]["error"] += 1
+                            else:
+                                stats[name]["empty"] += 1
+                            if page_error:
+                                errors.append(PageError(
+                                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    engine=name, filename=relative_name, page=page_number,
+                                    attempt=result.get("attempts", MAX_RETRIES), stage="OCR识别",
+                                    message=str(result.get("error", "未知OCR错误")),
+                                ))
+                            if not page_text:
+                                errors.append(PageError(
+                                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    engine=name, filename=relative_name, page=page_number,
+                                    attempt=result.get("attempts", "-"), stage="页面结果",
+                                    message="OCR及PDF文本层均未获得文本（并行单次渲染）",
+                                ))
+
+                        if uncertain_engines:
+                            recheck_image: Image.Image | None = None
+                            recheck_cache: Path | None = None
+                            try:
+                                recheck_image = render_page(page, SUSPECT_RECHECK_DPI)
+                                recheck_token = f"{os.getpid()}_{file_index}_{page_number}_recheck"
+                                recheck_cache, recheck_payload = _write_lossless_page_cache(
+                                    recheck_image, cache_dir, recheck_token
+                                )
+                                recheck_payload.update({
+                                    "kind": "recheck",
+                                    "filename": relative_name,
+                                    "page": page_number,
+                                    "recheck": True,
+                                })
+                                recheck_started = time.monotonic()
+
+                                def recheck_status(event: str, engine_name: str | None,
+                                                   details: dict[str, Any]) -> None:
+                                    if event == "heartbeat":
+                                        progress_state["heartbeat"] = int(details.get("heartbeat", 0))
+                                        for pending_name in details.get("pending", []):
+                                            progress_state["engines"][pending_name].update(
+                                                state="rechecking",
+                                                elapsed=round(time.monotonic() - recheck_started, 1),
+                                                message="500 DPI 疑似页二次精查中",
+                                            )
+                                        publish()
+                                    elif engine_name:
+                                        if event == "completed":
+                                            progress_state["engines"][engine_name].update(
+                                                state="recheck_done",
+                                                elapsed=round(float(details.get("elapsed", 0.0)), 1),
+                                                message="500 DPI 二次精查已完成",
+                                            )
+                                        elif event == "submitted":
+                                            progress_state["engines"][engine_name].update(
+                                                state="rechecking", elapsed=0.0,
+                                                message="500 DPI 疑似页二次精查中",
+                                            )
+                                        else:
+                                            progress_state["engines"][engine_name].update(
+                                                state="error",
+                                                message=str(details.get("error", "二次精查失败")),
+                                            )
+                                        publish()
+                                recheck_results = _execute_parallel_tasks(
+                                    workers, uncertain_engines, recheck_payload, recheck_status
+                                )
+                                for name in uncertain_engines:
+                                    result = recheck_results.get(name, {})
+                                    if result.get("ok"):
+                                        page_hits_by_engine[name] = _parallel_recheck_hits(
+                                            page_hits_by_engine[name], str(result.get("text", "")),
+                                            keywords, relative_name, page_number, name,
+                                        )
+                                    else:
+                                        errors.append(PageError(
+                                            timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+                                            engine=name, filename=relative_name, page=page_number,
+                                            attempt=result.get("attempts", "-"),
+                                            stage="疑似页二次精查",
+                                            message=str(result.get("error", "复核没有返回结果")),
+                                        ))
+                            except Exception as exc:  # Keep the initial 400-DPI hits.
+                                for name in uncertain_engines:
+                                    errors.append(PageError(
+                                        timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+                                        engine=name, filename=relative_name, page=page_number,
+                                        attempt="-", stage="疑似页二次精查",
+                                        message=(
+                                            f"500 DPI 复核渲染失败，已保留首次识别结果："
+                                            f"{type(exc).__name__}: {exc}"
+                                        ),
+                                    ))
+                            finally:
+                                if recheck_image is not None:
+                                    recheck_image.close()
+                                if recheck_cache is not None:
+                                    recheck_cache.unlink(missing_ok=True)
+
+                        for name, hits in page_hits_by_engine.items():
+                            file_hits[name].extend(hits)
+                        progress_state["page_complete"] = True
+                        for name in active:
+                            if progress_state["engines"][name]["state"] not in ("error",):
+                                progress_state["engines"][name].update(
+                                    state="page_done", page=page_number,
+                                    page_total=total_pages,
+                                    message="本页已完成" if page_number < total_pages else "末页已完成",
+                                )
+                        publish(f"第 {page_number}/{total_pages} 页双引擎会合完成")
+                        _print_progress(
+                            file_index, len(pdf_files), page_number, total_pages, relative_name
+                        )
+            except Exception as exc:  # noqa: BLE001 - preserve completed earlier files
+                file_open_failed = True
+                errors.append(PageError(
+                    timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+                    engine="renderer", filename=relative_name, page="-", attempt="-",
+                    stage="打开或遍历PDF", message=f"{type(exc).__name__}: {exc}",
+                ))
+                logging.exception("并行版无法处理 %s：%s", pdf_path, exc)
+            _finish_progress()
+
+            if not file_open_failed:
+                for name in active:
+                    append_raw_hits(raw_paths[name], file_hits[name])
+                    done[name].add(relative_name)
+                    state[f"{name}_done"] = sorted(done[name])
+                _save_state(state_dir, state)
+                dual_completed = sum(
+                    1 for _path, name_in_manifest in pdf_files
+                    if name_in_manifest in done["tesseract"]
+                    and name_in_manifest in done["paddle"]
+                )
+                progress_state.update(
+                    completed_files=dual_completed,
+                    file_complete=(relative_name in done["tesseract"] and
+                                   relative_name in done["paddle"]),
+                )
+                for name in active:
+                    progress_state["engines"][name].update(
+                        state="file_done", message="本文件全部页面已完成并保存原始结果"
+                    )
+                publish(
+                    f"文件双引擎完成：{relative_name}"
+                    if progress_state["file_complete"]
+                    else f"文件仅完成可用引擎：{relative_name}"
+                )
+                if "paddle" in active:
+                    paddle_files_since_restart += 1
+            gc.collect()
+
+            if (
+                paddle_files_since_restart >= PADDLE_BATCH_SIZE
+                and "paddle" in workers
+                and file_index < len(pdf_files)
+            ):
+                logging.info(
+                    "Paddle 已连续处理 %d 个文件，按稳定策略重启子进程释放原生内存",
+                    paddle_files_since_restart,
+                )
+                _restart_parallel_worker(workers, "paddle")
+                paddle_files_since_restart = 0
+    finally:
+        for worker in list(workers.values()):
+            _stop_parallel_worker(worker)
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+    progress_state["overall_state"] = (
+        "completed" if int(progress_state.get("completed_files", 0)) >= len(pdf_files)
+        else "incomplete"
+    )
+    publish("双引擎并行识别阶段结束")
+
+    for name in ("tesseract", "paddle"):
+        logging.info(
+            "========== %s 并行独立事件完成 | 总页=%d | 有文本=%d | 空页=%d | "
+            "失败=%d | 内存降级页=%d | 跳过已完成文件=%d ==========" ,
+            name, stats[name]["pages"], stats[name]["text"], stats[name]["empty"],
+            stats[name]["error"], stats[name]["fallback"], stats[name]["skipped_files"],
+        )
+    return (
+        stats["tesseract"] if tesseract_available else None,
+        stats["paddle"] if paddle_ran else None,
+        paddle_ran,
+    )
+# ===========================================================================
+
+
 def context_similarity(left: str, right: str) -> float:
     left_normalized = normalize_for_comparison(left)
     right_normalized = normalize_for_comparison(right)
@@ -1771,6 +2717,20 @@ def _save_state(state_dir: Path, state: dict) -> None:
     (state_dir / "state.json").write_text(
         json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+def _write_parallel_progress(state_dir: Path, progress: dict[str, Any]) -> None:
+    """Atomically publish compact parent-owned progress for the local web UI."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    path = state_dir / "parallel_progress.json"
+    temporary = state_dir / "parallel_progress.json.tmp"
+    snapshot = dict(progress)
+    snapshot["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    snapshot["updated_epoch"] = time.time()
+    temporary.write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    os.replace(temporary, path)
 
 
 def _clear_state(state_dir: Path) -> None:
@@ -2089,7 +3049,9 @@ def build_file_manifest(pdf_files: list[tuple[Path, str]]) -> list[dict[str, int
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="双引擎独立 OCR 与关键词提取")
+    parser = argparse.ArgumentParser(
+        description="单次渲染、双进程独立 OCR 与关键词提取（并行提速版）"
+    )
     parser.add_argument("input_dir", nargs="?", help="PDF 根目录")
     parser.add_argument("-k", "--keywords", help="关键词；多个词用逗号分隔")
     parser.add_argument(
@@ -2164,7 +3126,9 @@ def main() -> int:
     BINARIZE = args.binarize
 
     if args.check_env_only:
-        print("[环境检查] OCR 隔离环境可用。")
+        tesseract_path = configure_tesseract()
+        print(f"[环境检查] OCR Python 依赖可用。")
+        print(f"[环境检查] Tesseract 双引擎组件可用：{tesseract_path}")
         return 0
 
     if args.rebuild_results:
@@ -2281,12 +3245,13 @@ def main() -> int:
     tesseract_raw_path = state_dir / "tesseract_raw.csv"
     paddle_raw_path = state_dir / "paddle_raw.csv"
 
-    # 引擎分两个完整阶段顺序运行：各自打开 PDF、渲染页面、保存结果。
-    # 两者不共享页面图像或 OCR 结果，合并前不分主次。
+    # 两个 OCR 引擎仍是不分主次的独立事件；并行版只共享父进程生成的不可变
+    # 无损 RGB 像素。OCR 文本、重试、原始结果和完成状态仍分别保存。
     tesseract_available = False
     try:
-        configure_tesseract()
+        tesseract_path = configure_tesseract()
         tesseract_available = True
+        logging.info("Tesseract 已就绪：%s | 语言=%s", tesseract_path, TESS_LANG)
     except Exception as exc:
         errors.append(
             PageError(
@@ -2301,19 +3266,22 @@ def main() -> int:
         )
         logging.exception("Tesseract 初始化失败，仅使用 PaddleOCR：%s", exc)
 
-    if tesseract_available:
-        _, tesseract_stats = run_single_engine(
-            "tesseract", None, pdf_files, keywords, errors,
-            tesseract_raw_path, state, state_dir,
-        )
-    write_error_csv(output_dir / f"{OUTPUT_PREFIX}_errors.csv", errors)
-    gc.collect()
-
-    # Paddle 阶段用独立子进程分批处理：每个子进程处理一批后退出，操作系统强制
-    # 回收 Paddle 的 C++ 内存池（进程内 del/gc 无效），从而根治长期运行 OOM。
-    paddle_stats, paddle_ran = run_paddle_isolated(
-        pdf_files, keywords, errors, paddle_raw_path, state_dir,
-        output_dir / f"{OUTPUT_PREFIX}_paddle_worker.log", PADDLE_BATCH_SIZE,
+    parallel_started = time.perf_counter()
+    tesseract_stats, paddle_stats, paddle_ran = run_parallel_engines(
+        pdf_files,
+        keywords,
+        errors,
+        tesseract_raw_path,
+        paddle_raw_path,
+        state_dir,
+        output_dir,
+        tesseract_available,
+    )
+    parallel_elapsed = time.perf_counter() - parallel_started
+    logging.info(
+        "[性能统计] 单次渲染双进程识别阶段耗时 %.1f 秒（%.2f 小时）",
+        parallel_elapsed,
+        parallel_elapsed / 3600.0,
     )
     if not tesseract_available and not paddle_ran:
         logging.error("Tesseract 与 PaddleOCR 均不可用，跳过识别")
@@ -2418,4 +3386,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

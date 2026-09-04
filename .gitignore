@@ -18,8 +18,10 @@ runs/
 cma_results*.csv
 cma_results*.xlsx
 cma_results*.log
+CMA_OCR_最近一次结果.txt
+*.rgb
+*.tmp
+*.zip
 
 # Local documents are intentionally not versioned
 *.pdf
-
-

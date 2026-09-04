@@ -16,7 +16,7 @@ if not defined BASE_PY (
     )
 )
 
-set "OCR_SCRIPT=%~dp0cma_dual_keyword_enhanced.py"
+set "OCR_SCRIPT=%~dp0cma_dual_keyword_parallel.py"
 if not defined BASE_PY (
     echo [ERROR] Python was not found. Install Anaconda Python first.
     goto :failed
@@ -25,6 +25,13 @@ if not exist "%OCR_SCRIPT%" (
     echo [ERROR] OCR script was not found: %OCR_SCRIPT%
     goto :failed
 )
+echo [启动前检查] 正在确认双引擎和中文语言包...
+"%BASE_PY%" "%OCR_SCRIPT%" --check-env-only
+if errorlevel 1 (
+    set "RUN_EXIT=1"
+    goto :failed
+)
+echo.
 "%BASE_PY%" "%OCR_SCRIPT%"
 set "RUN_EXIT=%ERRORLEVEL%"
 if not "%RUN_EXIT%"=="0" goto :failed
@@ -42,4 +49,3 @@ echo Keep this window open and copy its complete output for diagnosis.
 popd
 pause
 exit /b 1
-
